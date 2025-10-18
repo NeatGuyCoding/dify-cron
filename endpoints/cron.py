@@ -1,8 +1,10 @@
 import datetime
 import json
 import logging
+import threading
 import time
 from collections.abc import Mapping
+from typing import Dict, Optional
 
 import requests
 from dify_plugin import Endpoint
@@ -10,26 +12,109 @@ from dify_plugin.core.runtime import Session
 from werkzeug import Request, Response
 from zoneinfo import ZoneInfo
 
-# 配置日志
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-running_app_ids = set()
+
+class CronTaskManager:
+    """Manage cron task execution with independent threads"""
+    
+    def __init__(self):
+        self._running_tasks: Dict[str, threading.Thread] = {}
+        self._lock = threading.Lock()
+    
+    def start_cron_task(self, app_id: str, session: Session, cron) -> bool:
+        """Start cron task for specified app with independent thread"""
+        with self._lock:
+            if app_id in self._running_tasks:
+                logger.warning(f"Cron task already running for app {app_id}")
+                return False
+            
+            # Create independent thread for this cron loop
+            thread = threading.Thread(
+                target=self._run_cron_loop,
+                args=(app_id, session, cron),
+                name=f"cron-{app_id}",
+                daemon=True  # Daemon thread will be killed when main process exits
+            )
+            thread.start()
+            self._running_tasks[app_id] = thread
+            logger.info(f"Started cron task for app {app_id} in independent thread")
+            return True
+    
+    def stop_cron_task(self, app_id: str) -> bool:
+        """Stop cron task for specified app"""
+        with self._lock:
+            if app_id not in self._running_tasks:
+                logger.warning(f"No running cron task found for app {app_id}")
+                return False
+            
+            # Get the thread and mark it for stopping
+            thread = self._running_tasks[app_id]
+            del self._running_tasks[app_id]
+            logger.info(f"Stopped cron task for app {app_id}")
+            
+            # Note: We don't forcefully kill the thread here as it's a daemon thread
+            # The thread will naturally exit when the cron loop detects the task is stopped
+            return True
+    
+    def is_task_running(self, app_id: str) -> bool:
+        """Check if cron task is running for specified app"""
+        with self._lock:
+            return app_id in self._running_tasks
+    
+    def get_running_tasks(self) -> Dict[str, threading.Thread]:
+        """Get all running tasks"""
+        with self._lock:
+            return self._running_tasks.copy()
+    
+    def get_task_count(self) -> int:
+        """Get number of running tasks"""
+        with self._lock:
+            return len(self._running_tasks)
+    
+    def _run_cron_loop(self, app_id: str, session: Session, cron) -> None:
+        """Execute cron loop in independent thread"""
+        logger.info(f"Starting cron loop for app {app_id} with cron string: {cron.cron_str}")
+        
+        try:
+            cron_loop(session, app_id, cron)
+        except Exception as e:
+            logger.error(f"Fatal error in cron loop for app {app_id}: {str(e)}")
+        finally:
+            # Clean up task record
+            with self._lock:
+                self._running_tasks.pop(app_id, None)
+            logger.info(f"Cron loop ended for app {app_id}")
 
 
-class JobManager:
-    def start(self, app_id: str) -> None:
-        global running_app_ids
-        running_app_ids.add(app_id)
+# Global task manager instance
+_cron_task_manager = CronTaskManager()
 
-    def stop(self, app_id: str) -> None:
-        global running_app_ids
-        running_app_ids.remove(app_id)
 
-    def is_running(self, app_id: str) -> bool:
-        global running_app_ids
-        return app_id in running_app_ids
+def cleanup_on_shutdown():
+    """Clean up all tasks when application shuts down"""
+    logger.info("Shutting down cron task manager...")
+    running_tasks = _cron_task_manager.get_running_tasks()
+    
+    for app_id in list(running_tasks.keys()):
+        logger.info(f"Stopping cron task for app {app_id}")
+        _cron_task_manager.stop_cron_task(app_id)
+    
+    # Wait for all daemon threads to finish (they should exit quickly)
+    logger.info("Waiting for cron threads to finish...")
+    for thread in running_tasks.values():
+        if thread.is_alive():
+            thread.join(timeout=5)  # Wait up to 5 seconds for each thread
+    
+    logger.info("Cron task manager shutdown complete")
 
+
+# Register cleanup function
+import atexit
+
+atexit.register(cleanup_on_shutdown)
 
 STATUS_ACTIVE_HTML = """
 <html><head></head><body>app-id: {app-id}<br>
@@ -141,23 +226,24 @@ def run_once(session: Session, app_id: str):
         raise
 
 
-def cron_loop(session: Session, job_man: JobManager, app_id: str, cron: Cron) -> None:
+def cron_loop(session: Session, app_id: str, cron: Cron) -> None:
     is_triggered = False
     loop_count = 0
     logger.info(f"Starting cron loop for app {app_id} with cron string: {cron.cron_str}")
-    
+
     try:
         while True:
-            if not job_man.is_running(app_id):
-                logger.info(f"Cron loop stopped for app {app_id} - job manager reports not running")
+            # Check if task is still running (managed by CronTaskManager)
+            if not _cron_task_manager.is_task_running(app_id):
+                logger.info(f"Cron loop stopped for app {app_id} - task manager reports not running")
                 break
-                
+
             loop_count += 1
-            if loop_count % 1000 == 0:  # 每1000次循环记录一次日志
+            if loop_count % 1000 == 0:  # Log every 1000 loops
                 logger.info(f"Cron loop running for app {app_id}, loop count: {loop_count}")
-                
+
             time.sleep(0.1)
-            
+
             try:
                 if cron.is_now_to_call():
                     if not is_triggered:
@@ -250,17 +336,21 @@ class CronEndpoint(Endpoint):
         command = values["command"]
         app_id = settings.get("app")["app_id"]
         cron = Cron(settings.get("cron_str"), timezone=settings.get("timezone", time.tzname[0]))
-        job_man = JobManager()
+
         try:
             cron.is_now_to_call()
         except:
             raise Exception("Invalid cron setting")
 
         if len(command) == 0 or command == "status":
-            if job_man.is_running(app_id):
+            # Check if task is running
+            is_running = _cron_task_manager.is_task_running(app_id)
+            if is_running:
                 html = STATUS_ACTIVE_HTML
             else:
                 html = STATUS_INACTIVE_HTML
+
+            # Replace status page variables
             html = html.replace("{app-id}", app_id)
             html = html.replace("{now_utc}", datetime.datetime.now(tz=ZoneInfo("UTC")).strftime("%d/%m/%Y, %H:%M:%S"))
             html = html.replace(
@@ -273,14 +363,21 @@ class CronEndpoint(Endpoint):
             html = html.replace("{d}", str(cron.schedule["mdays"]))
             html = html.replace("{months}", str(cron.schedule["months"]))
             html = html.replace("{w}", str(cron.schedule["wdays"]))
+
+            # Add running tasks information
+            running_tasks = _cron_task_manager.get_running_tasks()
+            tasks_info = f"<br>Running tasks: {len(running_tasks)}<br>Task IDs: {list(running_tasks.keys())}"
+            html = html.replace("</body>", f"{tasks_info}</body>")
+
             return Response(
                 html,
                 status=200,
                 content_type="text/html",
             )
+
         elif command == "stop":
-            if job_man.is_running(app_id):
-                job_man.stop(app_id)
+            success = _cron_task_manager.stop_cron_task(app_id)
+            if success:
                 return Response(
                     STOP_HTML,
                     status=200,
@@ -292,17 +389,21 @@ class CronEndpoint(Endpoint):
                     status=200,
                     content_type="text/html",
                 )
+
         elif command == "start":
-            if job_man.is_running(app_id):
+            success = _cron_task_manager.start_cron_task(app_id, self.session, cron)
+            if success:
+                return Response(
+                    START_HTML,
+                    status=200,
+                    content_type="text/html",
+                )
+            else:
                 return Response(
                     ALREADY_STARTED_HTML,
                     status=200,
                     content_type="text/html",
                 )
-            job_man.start(app_id)
-            logger.info(f"Starting cron for app {app_id} with cron string {cron.cron_str}")
-            cron_loop(self.session, job_man, app_id, cron)
-            logger.info(f"Stop cron for app {app_id}")
         else:
             return Response("Invalid Command")
 
