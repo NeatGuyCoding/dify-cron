@@ -1,19 +1,45 @@
 import datetime
+# Configure logging
 import json
 import logging
 import threading
 import time
 from collections.abc import Mapping
-from typing import Dict, Optional
+from typing import Dict
+from zoneinfo import ZoneInfo
 
 import requests
 from dify_plugin import Endpoint
 from dify_plugin.core.runtime import Session
 from werkzeug import Request, Response
-from zoneinfo import ZoneInfo
+class DifyPluginLogHandler(logging.Handler):
+    """Custom log handler that outputs logs in dify-plugin-daemon format"""
+    
+    def emit(self, record):
+        try:
+            # Format the log message
+            log_entry = {
+                "session_id": "",
+                "event": "log",
+                "data": {
+                    "level": record.levelname.lower(),
+                    "message": self.format(record),
+                    "timestamp": time.time()
+                }
+            }
+            # Output as JSON to stdout
+            print(json.dumps(log_entry), flush=True)
+        except Exception:
+            self.handleError(record)
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        DifyPluginLogHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 
