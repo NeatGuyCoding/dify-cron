@@ -1,5 +1,6 @@
 import datetime
 import json
+import logging
 import time
 from collections.abc import Mapping
 
@@ -8,6 +9,10 @@ from dify_plugin import Endpoint
 from dify_plugin.core.runtime import Session
 from werkzeug import Request, Response
 from zoneinfo import ZoneInfo
+
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 running_app_ids = set()
 
@@ -127,21 +132,49 @@ class Cron:
 
 
 def run_once(session: Session, app_id: str):
-    session.app.chat.invoke(app_id, "!cron!", {"is_cron": "yes"}, "blocking", "")
+    try:
+        logger.info(f"Executing cron job for app {app_id}")
+        session.app.chat.invoke(app_id, "!cron!", {"is_cron": "yes"}, "blocking", "")
+        logger.info(f"Cron job completed successfully for app {app_id}")
+    except Exception as e:
+        logger.error(f"Failed to execute cron job for app {app_id}: {str(e)}")
+        raise
 
 
 def cron_loop(session: Session, job_man: JobManager, app_id: str, cron: Cron) -> None:
     is_triggered = False
-    while True:
-        if not job_man.is_running(app_id):
-            break
-        time.sleep(0.1)
-        if cron.is_now_to_call():
-            if not is_triggered:
-                run_once(session, app_id)
-                is_triggered = True
-        else:
-            is_triggered = False
+    loop_count = 0
+    logger.info(f"Starting cron loop for app {app_id} with cron string: {cron.cron_str}")
+    
+    try:
+        while True:
+            if not job_man.is_running(app_id):
+                logger.info(f"Cron loop stopped for app {app_id} - job manager reports not running")
+                break
+                
+            loop_count += 1
+            if loop_count % 1000 == 0:  # 每1000次循环记录一次日志
+                logger.info(f"Cron loop running for app {app_id}, loop count: {loop_count}")
+                
+            time.sleep(0.1)
+            
+            try:
+                if cron.is_now_to_call():
+                    if not is_triggered:
+                        logger.info(f"Cron trigger detected for app {app_id}")
+                        run_once(session, app_id)
+                        is_triggered = True
+                else:
+                    is_triggered = False
+            except Exception as e:
+                logger.error(f"Error in cron loop for app {app_id}: {str(e)}")
+                time.sleep(1)
+                
+    except Exception as e:
+        logger.error(f"Fatal error in cron loop for app {app_id}: {str(e)}")
+        raise
+    finally:
+        logger.info(f"Cron loop ended for app {app_id}")
 
 
 class CronJobAPI:
@@ -267,9 +300,9 @@ class CronEndpoint(Endpoint):
                     content_type="text/html",
                 )
             job_man.start(app_id)
-            # print(f"Starting cron for app {app_id} with cron string {cron_str}")
+            logger.info(f"Starting cron for app {app_id} with cron string {cron.cron_str}")
             cron_loop(self.session, job_man, app_id, cron)
-            # print(f"Stop cron for app {app_id}")
+            logger.info(f"Stop cron for app {app_id}")
         else:
             return Response("Invalid Command")
 
